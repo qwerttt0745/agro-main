@@ -1,0 +1,24 @@
+venv/
+__pycache__/
+*.db
+server.log
+.venv/
+.env
+.DS_Store
+data/chroma/
+*.db-*
+data/farm_profile.json
+data/site/
+data/backups/
+
+data/auth_credentials.json
+data/first-login.txt
+data/auth_credentials.tmp
+
+# Private household data, downloaded books, model caches and evaluation conversations
+/data/
+/evaluation/
+.env.*
+*.pem
+*.key
+*.log

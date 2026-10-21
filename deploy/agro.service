@@ -1,0 +1,24 @@
+[Unit]
+Description=Private Agro Assistant
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=agro
+Group=agro
+WorkingDirectory=/opt/agro
+Environment=AGRO_COOKIE_SECURE=true
+Environment=HF_HOME=/opt/agro/data/hf-cache
+EnvironmentFile=/opt/agro/.env
+ExecStart=/opt/agro/.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --ws-max-size 400000 --proxy-headers --forwarded-allow-ips=127.0.0.1 --workers 1
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/agro/data
+
+[Install]
+WantedBy=multi-user.target
