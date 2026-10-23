@@ -46,6 +46,11 @@ class PersistenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, patch.object(db, 'DB', Path(tmp) / 'chats.db'):
             with sqlite3.connect(db.DB) as conn:
                 conn.executescript('CREATE TABLE chats(id INTEGER PRIMARY KEY, title TEXT, created_at TEXT); CREATE TABLE messages(id INTEGER PRIMARY KEY, chat_id INTEGER, role TEXT, content TEXT, pages TEXT, created_at TEXT); INSERT INTO chats VALUES(1, "old", "date"); INSERT INTO messages VALUES(1,1,"user","old question",NULL,"date");')
+            from app import auth
+            from scripts.migrate_users import migrate
+            record={'username':'legacy','salt':'00'*16,'hash':auth.digest('legacy-password','00'*16),'version':'old-version'}
+            (Path(tmp)/'auth_credentials.json').write_text(json.dumps(record))
+            migrate(Path(tmp))
             db.init(); db.init()
             self.assertEqual(db.get_messages(1)[0]['content'], 'old question')
             self.assertEqual(db.get_messages(1)[0]['sources'], [])

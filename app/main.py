@@ -1,15 +1,16 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
 # Імпортуємо твої модулі бази даних та RAG
-from app import db, rag, config, library, photos, model_pool, auth, weather, live, registers, fields, labels
+from app import db, rag, config, library, photos, model_pool, auth, weather, live, registers, fields, labels, locations
 from contextlib import asynccontextmanager
 import logging
 
 @asynccontextmanager
 async def lifespan(app):
+    auth.check_ready()
     db.init()
     yield
 
@@ -19,6 +20,7 @@ app.include_router(auth.router)
 app.include_router(live.router)
 app.include_router(fields.router)
 app.include_router(labels.router)
+app.include_router(locations.router)
 
 # Підключаємо папку зі статичними файлами (JS, CSS тощо)
 app.mount("/static", StaticFiles(directory=str(config.ROOT / "static")), name="static")
@@ -81,7 +83,7 @@ def generate_reply(chat_id, text, image, history):
                 'retryable':exc.status_code != 502,
                 'retry_after':min(waits) if waits and all(waits) else 0}
     except Exception as exc:
-        logging.getLogger(__name__).exception("Answer failed for chat %s", chat_id)
+        logging.getLogger(__name__).error("Answer failed for chat %s (%s)", chat_id,type(exc).__name__)
         raise HTTPException(503, "Не вдалося отримати відповідь. Питання збережено в історії. Спробуйте пізніше.") from exc
     db.add_message(chat_id, "assistant", result["answer"], result["pages"], result.get("sources", []))
     return result
@@ -146,9 +148,9 @@ def live_page():
 
 
 @app.get('/api/weather')
-def weather_data():
+def weather_data(field_id: int | None = Query(default=None,gt=0)):
     try:
-        return weather.forecast()
+        return weather.forecast(field_id=field_id) if field_id is not None else weather.forecast()
     except weather.WeatherUnavailable as exc:
         raise HTTPException(503, str(exc)) from exc
 

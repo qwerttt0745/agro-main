@@ -3,21 +3,54 @@ import json
 from app import config
 
 
+def private_json(name):
+    from app import db
+    from app.identity import user_id
+    with db._conn() as c:
+        row=c.execute('SELECT payload FROM user_documents WHERE user_id=? AND name=?',(user_id(),name)).fetchone()
+    return json.loads(row['payload']) if row else {}
+
+
 def profile():
-    path = config.DATA / 'farm_profile.json'
-    return json.loads(path.read_text()) if path.exists() else {}
+    return private_json('farm_profile.json')
+
+
+def location():
+    from app.locations import Location
+    from pydantic import ValidationError
+    p=profile()
+    try:
+        value=Location.model_validate({k:p[k] for k in ('latitude','longitude') if k in p})
+    except ValidationError:
+        value=Location()
+    legacy=p.get('location')
+    name=p.get('location_name',legacy if isinstance(legacy,str) else '')
+    return {**value.model_dump(),'location_name':name if isinstance(name,str) else ''}
+
+
+def save_location(value):
+    from app import db
+    from app.identity import user_id
+    # Read/merge/write under one SQLite write lock to preserve unrelated keys.
+    with db._conn() as c:
+        c.execute('BEGIN IMMEDIATE')
+        row=c.execute('SELECT payload FROM user_documents WHERE user_id=? AND name=?',(user_id(),'farm_profile.json')).fetchone()
+        p=json.loads(row['payload']) if row else {}
+        p.update(value.model_dump())
+        c.execute('INSERT INTO user_documents(user_id,name,payload) VALUES (?,?,?) ON CONFLICT(user_id,name) DO UPDATE SET payload=excluded.payload',
+                  (user_id(),'farm_profile.json',json.dumps(p,ensure_ascii=False)))
+    return value.model_dump()
 
 
 def climate():
-    path = config.DATA / 'site/summary.json'
-    return json.loads(path.read_text()) if path.exists() else {}
+    return private_json('site/summary.json')
 
 
 def context():
     p = profile()
     if not p:
         return ''
-    return ('Відомості користувача: господарство біля Паволочі. Культури: ' + ', '.join(p['crops']) +
+    return ('Відомості користувача: Культури: ' + ', '.join(p.get('crops',[])) +
             '. Якщо у запиті немає окремих записів поля чи даних користувача, межі, площа, тип ґрунту, pH, гумус, N/P/K, попередники, сорти, зрошення та моделі техніки невідомі. '
             'Не трактуй список культур як підтверджену сівозміну. Не роби висновків про ґрунт із координат. '
             'Для конкретного плану живлення потрібні аналіз ґрунту з методом і одиницями, культура, попередник, цільова врожайність та історія внесення.')

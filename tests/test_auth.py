@@ -14,7 +14,7 @@ class AuthTests(unittest.TestCase):
         for obj,key,value in [(auth,'CREDENTIALS',root/'credentials.json'),(auth,'DATABASE',root/'auth.db'),(db,'DB',root/'chats.db')]:
             p=patch.object(obj,key,value);p.start();self.addCleanup(p.stop)
         p=patch.dict(os.environ,{'AGRO_COOKIE_SECURE':'true','AGRO_PUBLIC_ORIGIN':'https://testserver'});p.start();self.addCleanup(p.stop)
-        auth.configure('tato','long-test-password')
+        auth.configure('tato','long-test-password',create=True)
         self.client=TestClient(app,base_url='https://testserver',headers={'X-Agro-Request':'1'})
         self.client.__enter__();self.addCleanup(self.client.__exit__,None,None,None)
 
@@ -42,12 +42,12 @@ class AuthTests(unittest.TestCase):
     def test_password_change_revokes_sessions_and_no_plaintext(self):
         self.login();auth.configure('tato','new-long-password')
         self.assertEqual(self.client.get('/chats').status_code,401)
-        self.assertNotIn('new-long-password',auth.CREDENTIALS.read_text())
+        self.assertNotIn(b'new-long-password',auth.DATABASE.read_bytes())
 
     def test_expired_session_and_missing_configuration_fail_closed(self):
         self.login()
         conn=auth.connect();conn.execute('UPDATE sessions SET expires=0');conn.commit();conn.close()
         self.assertEqual(self.client.get('/chats').status_code,401)
-        auth.CREDENTIALS.unlink()
-        self.assertEqual(self.login().status_code,503)
+        conn=auth.connect();conn.execute("UPDATE users SET is_active=0");conn.commit();conn.close()
+        self.assertEqual(self.login().status_code,401)
         self.assertEqual(self.client.get('/api/farm').status_code,401)

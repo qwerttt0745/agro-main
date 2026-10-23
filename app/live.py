@@ -8,10 +8,11 @@ from contextlib import asynccontextmanager
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from google import genai
 from google.genai import types
+from app.identity import current_user
 from app import auth, farm, rag, weather, registers
 
 router = APIRouter()
-_active = False
+_active = set()
 MAX_SECONDS = 300
 TOOLS = [{'function_declarations':[
     {'name':'farm_registry','description':'Пошук за точною назвою препарату або сорту в офіційному оприлюдненому реєстрі. Не є дозволом на застосування.','parameters':{'type':'OBJECT','properties':{'kind':{'type':'STRING','enum':['pesticides','varieties']},'query':{'type':'STRING'}},'required':['kind','query']}},
@@ -73,10 +74,11 @@ async def live_socket(ws:WebSocket):
     if not allowed(ws):
         await ws.close(code=1008);return
     await ws.accept()
-    if _active:
+    if ws.state.user_id in _active:
         await ws.send_json({'type':'error','message':'Інша розмова вже активна. Завершіть її перед новою.'})
         await ws.close(code=1013);return
-    _active=True
+    identity_token=current_user.set(ws.state.user_id)
+    _active.add(ws.state.user_id)
     tasks=[]
     client=None
     try:
@@ -173,6 +175,7 @@ async def live_socket(ws:WebSocket):
         try:
             if client:await client.aio.aclose()
         finally:
-            _active=False
+            _active.discard(ws.state.user_id)
+            current_user.reset(identity_token)
         try:await ws.close()
         except Exception:pass

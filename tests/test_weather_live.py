@@ -19,6 +19,8 @@ def payload():
 class WeatherTests(unittest.TestCase):
     def setUp(self):
         weather._cache=None;weather._retry_at=0
+        profile=patch.object(weather.farm,"profile",return_value={"latitude":49,"longitude":29})
+        profile.start();self.addCleanup(profile.stop)
     def test_cache_coordinates_and_missing_values(self):
         with patch.object(weather.requests,'get',return_value=Mock(json=lambda:payload())) as get:
             first=weather.forecast();weather.forecast();self.assertEqual(get.call_count,1)
@@ -68,7 +70,7 @@ class LiveTests(unittest.TestCase):
                 await asyncio.sleep(100)
                 if False:yield None
         client=SimpleNamespace(aio=SimpleNamespace(live=SimpleNamespace(connect=lambda **kwargs:Session()),aclose=AsyncMock()))
-        with TestClient(app) as web,patch.object(live,'allowed',return_value=True),patch.object(live.genai,'Client',return_value=client):
+        with TestClient(app) as web,patch.object(live,'allowed',side_effect=lambda ws: (setattr(ws.state,'user_id',1) or True)),patch.object(live.genai,'Client',return_value=client):
             with web.websocket_connect('/api/live') as ws:
                 self.assertEqual(ws.receive_json()['type'],'ready')
                 ws.send_json({'type':'stop'})
@@ -85,7 +87,7 @@ class LiveTests(unittest.TestCase):
                 await asyncio.sleep(100)
                 if False:yield None
         client=SimpleNamespace(aio=SimpleNamespace(live=SimpleNamespace(connect=lambda **kwargs:Session()),aclose=AsyncMock()))
-        with TestClient(app) as web,patch.object(live,'allowed',return_value=True),patch.object(live.genai,'Client',return_value=client):
+        with TestClient(app) as web,patch.object(live,'allowed',side_effect=lambda ws: (setattr(ws.state,'user_id',1) or True)),patch.object(live.genai,'Client',return_value=client):
             with web.websocket_connect('/api/live') as ws:
                 ws.receive_json()
                 ws.send_json({'type':'audio','data':base64.b64encode(b'\x00\x00'*1600).decode()})

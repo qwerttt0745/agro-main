@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 from PIL import Image
 from fastapi.testclient import TestClient
-from app import auth,live
+from app import auth,live,db
 from app.main import app
 
 
@@ -20,8 +20,11 @@ def main():
     first_text_length=0
     report={'weather_tool_called':False,'audio_bytes':0,'transcript':'','ready':False,'frame_sent':False}
     started=time.monotonic()
-    with tempfile.TemporaryDirectory() as directory,patch.object(auth,'CREDENTIALS',Path(directory)/'credentials.json'),patch.object(auth,'DATABASE',Path(directory)/'auth.db'),patch.dict('os.environ',{'AGRO_COOKIE_SECURE':'false','AGRO_PUBLIC_ORIGIN':'http://testserver'}),patch.object(live,'MAX_SECONDS',40):
-        auth.configure('smoke','temporary-test-password')
+    with tempfile.TemporaryDirectory() as directory,patch.object(auth,'CREDENTIALS',Path(directory)/'credentials.json'),patch.object(auth,'DATABASE',Path(directory)/'auth.db'),patch.object(db,'DB',Path(directory)/'chats.db'),patch.dict('os.environ',{'AGRO_COOKIE_SECURE':'false','AGRO_PUBLIC_ORIGIN':'http://testserver'}),patch.object(live,'MAX_SECONDS',40):
+        auth.configure('smoke','temporary-test-password',create=True)
+        db.init()
+        if tool_check:
+            with db._conn() as c:c.execute('INSERT INTO user_documents VALUES (?,?,?)',(1,'farm_profile.json',json.dumps({'latitude':49.8,'longitude':29.4})))
         with TestClient(app) as client:
             r=client.post('/auth/login',json={'username':'smoke','password':'temporary-test-password'},headers={'X-Agro-Request':'1','Origin':'http://testserver'})
             assert r.status_code==200

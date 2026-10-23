@@ -8,10 +8,14 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 import requests
 from app import farm
+from app.identity import user_id
+from app.locations import Coordinates
+from pydantic import ValidationError
+from collections import OrderedDict
 
 _lock = threading.Lock()
-_cache = None
-_retry_at = 0
+_cache = OrderedDict()
+_retry_at = {}
 TTL = 900
 
 
@@ -19,18 +23,39 @@ class WeatherUnavailable(RuntimeError):
     pass
 
 
-def forecast():
+def forecast(field_id=None):
     global _cache, _retry_at
-    p = farm.profile()
-    point = (p.get('latitude'), p.get('longitude'))
+    if field_id is None:
+        p=farm.profile()
+        label=p.get('location_name',p.get('location',''))
+    else:
+        from app import fields
+        p=fields.get(field_id)
+        label=p.get('location_name') or p['name']
+        if p.get('latitude') is None and p.get('longitude') is None and p.get('boundary'):
+            from app.boundaries import Boundary
+            try:p={**p,**Boundary.model_validate(p['boundary']).weather_point()}
+            except ValidationError:raise WeatherUnavailable('Межі поля некоректні. Уточніть їх на карті.') from None
+    try:coords=Coordinates.model_validate(p)
+    except ValidationError:
+        raise WeatherUnavailable('Збережені координати некоректні. Уточніть точку на карті.') from None
+    point=(coords.latitude,coords.longitude)
     if None in point:
-        raise WeatherUnavailable('Спочатку потрібні координати господарства.')
+        raise WeatherUnavailable('Спочатку задайте координати поля.' if field_id is not None else 'Спочатку задайте координати господарства на сторінці «Моє господарство».')
+    selected={'latitude':point[0],'longitude':point[1],'location_name':label if isinstance(label,str) else '',
+              'kind':'field' if field_id is not None else 'farm','field_id':field_id}
+    cache_key=(user_id(),field_id,point)
     with _lock:
-        now = time.time()
-        cached = _cache if _cache and _cache['point'] == point else None
-        if cached and now - cached['at'] < TTL:
-            return copy.deepcopy(cached['data'])
-        if now < _retry_at:
+        # Compatibility with old tests/tools resetting these module globals.
+        if not isinstance(_cache,OrderedDict):_cache=OrderedDict()
+        if not isinstance(_retry_at,dict):_retry_at={}
+        now=time.time()
+        _retry_at={k:v for k,v in _retry_at.items() if v>now}
+        cached=_cache.get(cache_key)
+        if cached and now-cached['at']<TTL:
+            _cache.move_to_end(cache_key)
+            return {**copy.deepcopy(cached['data']),'location':selected}
+        if now<_retry_at.get(cache_key,0):
             raise WeatherUnavailable('Погодний сервіс тимчасово недоступний. Повторіть за хвилину.')
         key = os.getenv('OPEN_METEO_API_KEY')
         params = {'latitude':point[0], 'longitude':point[1], 'timezone':'Europe/Kyiv',
@@ -61,10 +86,13 @@ def forecast():
                     'days':days, 'daily_units':raw['daily_units'],
                     'note':'Модельний прогноз для околиць точки, не вимірювання на полі. Час — Київ. Прогноз не гарантує опадів; стан конкретного поля потрібно перевірити на місці.'}
         except (requests.RequestException, ValueError, KeyError, IndexError, TypeError) as exc:
-            _retry_at = now + 60
+            _retry_at[cache_key]=now+60
+            if len(_retry_at)>128:_retry_at.pop(next(iter(_retry_at)))
             raise WeatherUnavailable('Не вдалося оновити прогноз. Застарілі значення не видаються як поточна погода.') from exc
-        _cache = {'point':point, 'at':now, 'data':data}
-        return copy.deepcopy(data)
+        _cache[cache_key]={'at':now,'data':data}
+        _cache.move_to_end(cache_key)
+        while len(_cache)>128:_cache.popitem(last=False)
+        return {**copy.deepcopy(data),'location':selected}
 
 
 def is_question(question):
@@ -82,7 +110,7 @@ def answer(question):
     except WeatherUnavailable as exc:
         return {'answer':str(exc),'pages':[],'sources':[],'status':'weather_unavailable'}
     fmt=lambda v: 'немає даних' if v is None else str(v).replace('.',',')
-    lines=['Прогноз для точки господарства біля Паволочі (час Києва):']
+    lines=['Прогноз для точки господарства (час Києва):']
     current=data.get('current',{})
     if current.get('time'):
         lines.append(f"Поточна модельна оцінка на {current['time']}: {fmt(current.get('temperature_2m'))} °C; вітер {fmt(current.get('wind_speed_10m'))} м/с, пориви {fmt(current.get('wind_gusts_10m'))} м/с.")
@@ -120,7 +148,7 @@ def context_chunk(source_id):
     data=forecast()
     fmt=lambda v:'немає даних' if v is None else str(v).replace('.',',')
     c=data.get('current',{})
-    lines=[f"Open-Meteo, точка господарства біля Паволочі. Отримано {data['retrieved_at']}. Час прогнозу: Europe/Kyiv."]
+    lines=[f"Open-Meteo, точка господарства. Отримано {data['retrieved_at']}. Час прогнозу: Europe/Kyiv."]
     lines.append(f"Поточна модельна оцінка {c.get('time','час невідомий')}: температура {fmt(c.get('temperature_2m'))} °C; відносна вологість повітря {fmt(c.get('relative_humidity_2m'))} %; вітер {fmt(c.get('wind_speed_10m'))} м/с; пориви {fmt(c.get('wind_gusts_10m'))} м/с.")
     for d in data.get('days',[]):
         lines.append(f"{d['date']}: температура {fmt(d.get('temperature_2m_min'))}…{fmt(d.get('temperature_2m_max'))} °C; опади за добу {fmt(d.get('precipitation_sum'))} мм; максимальна ймовірність опадів {fmt(d.get('precipitation_probability_max'))} %.")
