@@ -24,11 +24,25 @@ def snapshot(data):
     folder.mkdir(parents=True,mode=0o700)
     os.chmod(folder,0o700)
     paths=[]
-    for path in data.rglob('*'):
-        relative=path.relative_to(data)
-        if relative.parts[0] in ('backups','chroma') or not path.is_file():continue
-        if path.is_symlink():raise ValueError('Symlinks are not supported in migration data')
-        if path.suffix in ('.db','.sqlite','.sqlite3','.json'):paths.append(path)
+    # Prune reproducible caches before inspecting files. Hugging Face snapshots
+    # intentionally contain symlinks to model blobs; they are not private data.
+    excluded={'backups','chroma','hf-cache'}
+    extensions={'.db','.sqlite','.sqlite3','.json'}
+    for directory,dirs,files in os.walk(data,topdown=True,followlinks=False):
+        directory=Path(directory)
+        if directory==data:
+            dirs[:]=[name for name in dirs if name not in excluded]
+        for name in dirs:
+            path=directory/name
+            if path.is_symlink():
+                raise ValueError(f'Symlink directory in migration data: {path.relative_to(data)}')
+        for name in files:
+            path=directory/name
+            if directory==data and name in excluded:continue
+            if path.suffix not in extensions:continue
+            if path.is_symlink():
+                raise ValueError(f'Symlink in migration data: {path.relative_to(data)}')
+            if path.is_file():paths.append(path)
     for path in paths:
         target=folder/path.relative_to(data)
         target.parent.mkdir(parents=True,exist_ok=True)
@@ -50,8 +64,9 @@ def verify(folder):
     folder=Path(folder).resolve()
     manifest=json.loads((folder/'migration-manifest.json').read_text())
     for name,digest in manifest['files'].items():
-        path=(folder/name).resolve()
-        if not path.is_relative_to(folder) or path.is_symlink() or hashlib.sha256(path.read_bytes()).hexdigest()!=digest:
+        source=folder/name
+        path=source.resolve()
+        if not path.is_relative_to(folder) or source.is_symlink() or hashlib.sha256(path.read_bytes()).hexdigest()!=digest:
             raise ValueError('Snapshot checksum mismatch')
         if path.suffix in ('.db','.sqlite','.sqlite3'):check_database(path)
         elif path.suffix=='.json':json.loads(path.read_text())
