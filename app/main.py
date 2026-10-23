@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field, field_validator
 # Імпортуємо твої модулі бази даних та RAG
 from app import db, rag, config, library, photos, model_pool, auth, weather, live, registers, fields, labels, locations
 from contextlib import asynccontextmanager
+from app.performance import request as performance_request
 import logging
 
 @asynccontextmanager
@@ -75,7 +76,8 @@ def ask(chat_id: int, q: Question):
 
 def generate_reply(chat_id, text, image, history):
     try:
-        result = rag.answer_photo(text, image, history) if image else rag.answer(text, history)
+        with performance_request('photo' if image else 'text'):
+            result = rag.answer_photo(text, image, history) if image else rag.answer(text, history)
     except rag.ServiceUnavailable as exc:
         # No assistant row for temporary failures: retry reuses the saved user row/photo.
         waits = [s['retry_after'] for s in model_pool.status()]

@@ -351,7 +351,9 @@ async function ask(text){
     add('user', (attached ? photoHtml(attached.url) : '') + esc(text));
     clearPhoto();
     q.value = ''; q.style.height = 'auto';
-    const wait = add('bot', '<span class="dots"><span></span><span></span><span></span></span>');
+    const wait = add('bot', '<span class="dots"><span></span><span></span><span></span></span><small data-wait-time style="display:block"></small>');
+    const startedAt=Date.now();
+    const waitTimer=setInterval(()=>{const note=wait.querySelector('[data-wait-time]');if(note){const seconds=Math.floor((Date.now()-startedAt)/1000);note.textContent=(seconds>=20?'Обробка триває довше звичайного… ':'Шукаю відповідь і перевіряю джерела… ')+seconds+' с';}},1000);
     
     try {
       const r = await api(`/chats/${chatId}/ask`, {
@@ -362,6 +364,8 @@ async function ask(text){
     } catch (e) {
       wait.querySelector('.body').innerHTML =
         '<p class="err">' + esc(e.message) + '</p>';
+    } finally {
+      clearInterval(waitTimer);
     }
     scroll.scrollTop = scroll.scrollHeight;
     await loadList().catch(showError);

@@ -61,5 +61,6 @@ def status():
         now=time.time()
         return [{'model':m, 'retry_after':max(0, math.ceil(_state.get(m,{}).get('until',0)-now)),
                  'reason':_state.get(m,{}).get('reason'),
-                 'last_success':_state.get(m,{}).get('last_success')}
+                 'last_success':_state.get(m,{}).get('last_success'),
+                 'latency_seconds':_state.get(m,{}).get('latency_seconds')}
                 for m in MODELS]
