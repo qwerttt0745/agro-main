@@ -8,6 +8,8 @@ from app import db, rag, config, library, photos, model_pool, auth, weather, liv
 from contextlib import asynccontextmanager
 from app.performance import request as performance_request
 import logging
+from app import generation
+from app.identity import user_id
 
 @asynccontextmanager
 async def lifespan(app):
@@ -26,7 +28,11 @@ app.include_router(locations.router)
 # Підключаємо папку зі статичними файлами (JS, CSS тощо)
 app.mount("/static", StaticFiles(directory=str(config.ROOT / "static")), name="static")
 
-class Question(BaseModel):
+class RequestControl(BaseModel):
+    request_id: str | None = Field(default=None,min_length=16,max_length=64,pattern=r"^[a-zA-Z0-9_-]+$")
+
+
+class Question(RequestControl):
     text: str = Field(min_length=1, max_length=8000)
     photo: str | None = Field(default=None, max_length=8 * 1024 * 1024)
 
@@ -58,41 +64,47 @@ def chat(chat_id: int):
     return db.get_messages(chat_id)
 
 @app.post("/chats/{chat_id}/ask")
-def ask(chat_id: int, q: Question):
+async def ask(chat_id: int, q: Question):
     if not db.chat_exists(chat_id):
         raise HTTPException(404, "Чат не знайдено")
     
-    try:
-        image = photos.prepare(q.photo) if q.photo is not None else None
-    except ValueError as exc:
-        raise HTTPException(422, str(exc)) from exc
-    history = db.get_messages(chat_id)[-12:]
-
-    # 1. Зберігаємо запитання користувача в базу
-    db.add_message(chat_id, "user", q.text, photo=image)
-    
-    return generate_reply(chat_id, q.text, image, history)
+    job=generation.start(user_id(),chat_id,q.request_id)
+    def work():
+        try:
+            image=photos.prepare(q.photo) if q.photo is not None and not job.event.is_set() else None
+        except ValueError as exc:
+            raise HTTPException(422,str(exc)) from exc
+        history=db.get_messages(chat_id)[-12:]
+        db.add_message(chat_id,'user',q.text,photo=image)
+        generation.check()
+        return generate_reply(chat_id,q.text,image,history)
+    return await generation.run(job,work)
 
 
 def generate_reply(chat_id, text, image, history):
+    generation.check()
     try:
         with performance_request('photo' if image else 'text'):
             result = rag.answer_photo(text, image, history) if image else rag.answer(text, history)
+    except generation.Cancelled:
+        raise
     except rag.ServiceUnavailable as exc:
+        generation.check()
         # No assistant row for temporary failures: retry reuses the saved user row/photo.
         waits = [s['retry_after'] for s in model_pool.status()]
         return {'answer':str(exc), 'pages':[], 'sources':[], 'status':'unavailable',
                 'retryable':exc.status_code != 502,
                 'retry_after':min(waits) if waits and all(waits) else 0}
     except Exception as exc:
+        generation.check()
         logging.getLogger(__name__).error("Answer failed for chat %s (%s)", chat_id,type(exc).__name__)
         raise HTTPException(503, "Не вдалося отримати відповідь. Питання збережено в історії. Спробуйте пізніше.") from exc
-    db.add_message(chat_id, "assistant", result["answer"], result["pages"], result.get("sources", []))
+    generation.store(lambda:db.add_message(chat_id,"assistant",result["answer"],result["pages"],result.get("sources",[])))
     return result
 
 
 @app.post('/chats/{chat_id}/retry')
-def retry_question(chat_id: int):
+async def retry_question(chat_id: int, control: RequestControl | None = None):
     if not db.chat_exists(chat_id):
         raise HTTPException(404, 'Чат не знайдено')
     messages = db.get_messages(chat_id)
@@ -100,7 +112,16 @@ def retry_question(chat_id: int):
         raise HTTPException(409, 'Немає запиту, що очікує відповіді')
     latest = messages[-1]
     image = db.get_photo(chat_id, latest['photo_url'].rsplit('/',1)[-1]) if latest.get('photo_url') else None
-    return generate_reply(chat_id, latest['content'], image, messages[:-1][-12:])
+    job=generation.start(user_id(),chat_id,control.request_id if control else None)
+    return await generation.run(job,lambda:generate_reply(chat_id,latest['content'],image,messages[:-1][-12:]))
+
+
+@app.post('/chats/{chat_id}/cancel')
+def cancel_question(chat_id:int,control:RequestControl):
+    if not db.chat_exists(chat_id):raise HTTPException(404,'Чат не знайдено')
+    if not control.request_id:raise HTTPException(422,'Потрібен номер запиту.')
+    status=generation.cancel(user_id(),chat_id,control.request_id)
+    return {'status':status,'request_id':control.request_id}
 
 
 @app.get('/api/models')

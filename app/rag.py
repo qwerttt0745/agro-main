@@ -9,6 +9,8 @@ from app import library, farm, model_pool, intent, weather, registers, fields
 import json
 from functools import lru_cache
 from app.performance import stage
+from app import generation
+from app.language import PLAIN_UKRAINIAN
 
 LLM_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 
@@ -29,6 +31,8 @@ SYSTEM = """Ти агрономічний помічник для господа
 11. Для рішення про збирання враховуй разом останнє питання, дані користувача з історії, погодний прогноз на конкретну дату й спостереження з фото. Явно врахуй надані дані: сушарка є; якщо вказана вологість землі, поясни, чого вона дозволяє і не дозволяє виснувати. Не перепитуй наявність сушарки, якщо користувач її вже підтвердив. Не вимагай лабораторію для вологості зерна: запитай вимір вологоміром. Почни з практичного умовного висновку щодо запитаної дати: чи є підстави попередньо планувати роботу і що може змінити рішення. За фото опиши видимі ознаки виповненості/підсихання, але не оголошуй стиглість або відсоток вологості встановленими. Якщо основа зернівки не видима, не вигадуй чорний шар. Вологість землі сама по собі без типу ґрунту й методу вимірювання не визначає прохідність. Відділяй дані користувача та фото від фактів книжок, не приписуй їм бібліотечні цитати.
 12. Відповідай повно на поставлене питання: якщо є базове значення й поправка, наведи обидва, не лише поправку. Не оголошуй один сорт найкращим без порівняльних даних у відповідних умовах.
 """
+
+SYSTEM += "\n"+PLAIN_UKRAINIAN
 
 REWRITE = """Дано історію діалогу і нове питання користувача.
 Збережи намір і всі числа та одиниці нового запиту. Коротке «а для Паволочі?» продовжує попередню тему, а не запитує загальний опис міста. Відповіді помічника можуть бути помилковими; вони не встановлені факти. Перепиши нове питання так, щоб воно було зрозуміле без історії (додай культуру чи тему, якщо вони випливають з історії).
@@ -84,24 +88,28 @@ def llm_client():
 
 
 def _generate(contents, system=None, temperature=0.2, deadline=None, response_schema=None, request_timeout=20, max_attempts=None):
+    generation.check()
     from google.genai import types, errors
     import httpx
 
     deadline = deadline if deadline is not None else time.monotonic() + GENERATION_BUDGET_SECONDS
     models = model_pool.candidates()
-    if max_attempts is not None:models=models[:max_attempts]
     if not models:
         raise ServiceUnavailable("Моделі зараз на паузі після перевантаження або ліміту квоти. Запит збережено; повторіть пізніше.", 503)
     client = llm_client()
+    slow_attempts=0
     for attempt, model in enumerate(models):
+        generation.check()
+        if max_attempts is not None and slow_attempts>=max_attempts:break
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
-        # Reserve time for the remaining alternatives, including image requests.
+        # Fast quota/missing-model failures can use the wider pool; slow calls
+        # remain bounded by max_attempts and the shared deadline.
         timeout = min(request_timeout, remaining)
         started = time.monotonic()
         try:
-            thinking=types.ThinkingConfig(thinking_level='LOW') if model in ('gemini-3.8-flash','gemini-3.6-flash') else None
+            thinking=types.ThinkingConfig(thinking_level='LOW') if model in ('gemini-3.8-flash','gemini-3.6-flash','gemini-3-flash-preview') else None
             with stage('provider',model=model,attempt=attempt+1,timeout_seconds=round(timeout,2)):
                 response = client.models.generate_content(
                     model=model, contents=contents,
@@ -115,6 +123,7 @@ def _generate(contents, system=None, temperature=0.2, deadline=None, response_sc
                     ),
                 )
         except errors.APIError as exc:
+            generation.check()
             code = exc.code
             if code == 401 or code == 400:
                 raise ServiceUnavailable("Gemini не прийняв ключ або формат запиту. Потрібна перевірка налаштувань; запит збережено.", 502) from exc
@@ -126,12 +135,17 @@ def _generate(contents, system=None, temperature=0.2, deadline=None, response_sc
                 reason = 'overloaded'
             else:
                 raise ServiceUnavailable("Gemini відхилив запит. Запит збережено.", 502) from exc
+            if time.monotonic()-started>=1:slow_attempts+=1
             model_pool.failure(model, reason, exc)
             logging.getLogger(__name__).warning("Gemini switch: model=%s code=%s", model, code)
         except (httpx.TimeoutException, httpx.TransportError):
+            generation.check()
+            slow_attempts+=1
             model_pool.failure(model, 'connection')
         else:
+            generation.check()
             if not response.text or not response.text.strip():
+                if time.monotonic()-started>=1:slow_attempts+=1
                 model_pool.failure(model, 'empty')
                 continue
             model_pool.success(model, time.monotonic() - started)
@@ -182,8 +196,10 @@ def retrieve(question, n_results=10):
         return []
     with stage('embedding_load'):
         model=embedding_model()
+    generation.check()
     with stage('embedding_encode'):
         q=model.encode("query: "+question,normalize_embeddings=True).tolist()
+    generation.check()
     with stage('vector_search'):
         res=col.query(query_embeddings=[q],n_results=min(n_results*3,count),
                       include=["documents","metadatas","distances"])
@@ -223,15 +239,16 @@ def refusal(search_q, reason="insufficient"):
             "pages": [], "sources": [], "searched_as": search_q, "status": reason}
 
 
-def validate_answer(raw, chunks, search_q):
+def validate_answer(raw, chunks, search_q, *, general_overview=False):
     try:
         result = GroundedAnswer.model_validate_json(raw)
     except (ValueError, TypeError):
         return refusal(search_q, "invalid_evidence")
-    if result.pesticide_application:
-        return special_response(search_q, 'label_required')
-    if result.needs_field_data:
-        return special_response(search_q, 'field_data_required')
+    if general_overview:
+        if intent.contains_prescription(result.answer):return refusal(search_q,'scope_mismatch')
+    else:
+        if result.pesticide_application:return special_response(search_q,'label_required')
+        if result.needs_field_data:return special_response(search_q,'field_data_required')
     if result.insufficient:
         return refusal(search_q)
     available = {chunk["id"]: chunk for chunk in chunks}
@@ -259,14 +276,16 @@ def validate_answer(raw, chunks, search_q):
 
 
 def special_response(question, status):
-    message = ("Для конкретної обробки потрібні назва препарату, чинна українська етикетка, культура, шкідливий організм, фаза розвитку та умови поля. Для пошуку в оприлюдненому реєстрі напишіть «Перевір препарат: точна назва». Чинна етикетка ще не перевіряється автоматично. Тому не призначатиму дозу, суміш або дату обробки зі старої книги. Перевірте препарат в офіційному реєстрі: https://my.eco.gov.ua/pesticides"
+    message = ("Щоб підказати, чим обробити поле, треба знати культуру, проблему й назву засобу. Також потрібна чинна інструкція до нього. За старою книжкою не можна надійно підібрати кількість засобу чи суміш. Для пошуку напишіть «Перевір препарат: назва». Офіційний реєстр: https://my.eco.gov.ua/pesticides"
                if status == 'label_required' else
-               "Щоб розрахувати план живлення поля, потрібні культура, попередник, цільова врожайність, аналіз ґрунту (дата, глибина, метод і одиниці) та вже внесені добрива. Координат для норми внесення недостатньо. Якщо цільова кількість азоту вже визначена, у розділі «Господарство» є калькулятор перерахунку в масу добрива.")
+               "Щоб порахувати, скільки добрив потрібно саме вашому полю, треба знати: що росте зараз, що росло раніше, який урожай хочете отримати, результати аналізу землі та що вже вносили. Самого розташування поля недостатньо. Якщо потрібна кількість азоту вже відома, у розділі «Господарство» є калькулятор добрив.")
     return {'answer':message, 'pages':[], 'sources':[], 'searched_as':question, 'status':status}
 
 
 def answer(question, history=None, n_results=10, deadline=None, photo_context=None):
+    generation.check()
     deadline = deadline if deadline is not None else time.monotonic() + GENERATION_BUDGET_SECONDS
+    general_overview=intent.general_cultivation(question)
     calculation=intent.drying_answer(question)
     harvest_followup=any(weather.field_work(m['content']) for m in (history or [])[-6:] if m['role']=='user')
     if calculation and (not harvest_followup or re.search(r'розрах|порах|усуш|скільки.*(?:ваг|мас)|заліков',question.lower())):return calculation
@@ -274,7 +293,7 @@ def answer(question, history=None, n_results=10, deadline=None, photo_context=No
     if register_query:
         return registers.answer(*register_query)
     resolved=None
-    if history and len(question)<40 and re.match(r'^(а |і |тоді|а завтра|а сьогодні)',question.lower()):
+    if not general_overview and history and len(question)<40 and re.match(r'^(а |і |тоді|а завтра|а сьогодні)',question.lower()):
         resolved=standalone_question(question,history,deadline=deadline)
     if weather.simple_question(resolved or question):
         return weather.answer(resolved or question)
@@ -287,10 +306,12 @@ def answer(question, history=None, n_results=10, deadline=None, photo_context=No
         result["answer"] = "У моїх матеріалах цього немає. Бібліотека ще не проіндексована."
         return result
     # Explicit quantities must not be changed by a generative rewrite.
-    search_q = resolved or (question if intent.seed_mass(question) is not None else
-                standalone_question(question, history or [], deadline=deadline))
+    search_q = (intent.overview_question(question,history) if general_overview else
+                resolved or (question if intent.seed_mass(question) is not None else
+                standalone_question(question,history or [],deadline=deadline)))
     with stage('retrieval'):
         chunks = intent.relevant_chunks(search_q, retrieve(intent.search_terms(search_q), n_results))
+    generation.check()
     calculated = intent.seed_answer(search_q, chunks)
     if calculated:
         return validate_answer(json.dumps(calculated,ensure_ascii=False),chunks,search_q)
@@ -316,13 +337,16 @@ def answer(question, history=None, n_results=10, deadline=None, photo_context=No
         for c in chunks)
     dialogue = "\n".join(f"{m['role']}: {m['content'][:1200]}" for m in (history or [])[-10:])
     request_context = f"ОРИГІНАЛЬНЕ ПИТАННЯ: {question}\nЗАПИСИ ПОЛІВ: {fields.context(search_q)}\nІСТОРІЯ (не джерело агрономічних фактів):\n{dialogue}\nКОНТЕКСТ:\n{context}\n\nПИТАННЯ: {search_q}\nПОГОДНІ ДАНІ: {weather_note}\nСПОСТЕРЕЖЕННЯ З ПОТОЧНОГО ФОТО (не виміри, можуть бути помилковими): {photo_context or 'немає нового фото'}"
+    if general_overview:
+        request_context+='\nРЕЖИМ: загальний практичний огляд вирощування культури. Дай підтверджені джерелами основні етапи: місце/попередники, підготовка, сівба, догляд, збирання — лише ті, що підтверджені контекстом. Відсутність аналізу ґрунту не заважає пояснити загальні принципи. Не підміняй огляд шаблоном про пестициди або план живлення. Не призначай конкретні препарати, суміші чи норми добрив; за потреби опусти цю частину. У кінці можна поставити одне уточнення, наприклад озима чи яра пшениця. pesticide_application=false, needs_field_data=false для такого огляду. Не вигадуй відсутні факти.'
     with stage('answer_generate',context_chars=len(request_context),sources=len(chunks)):
         raw = _generate(request_context,system=SYSTEM+"\n"+farm.context(),
                         deadline=deadline,response_schema=GroundedAnswer,request_timeout=15,max_attempts=2)
     with stage('citation_validation') as metrics:
-        result = validate_answer(raw, chunks, search_q)
+        result = validate_answer(raw,chunks,search_q,general_overview=general_overview)
         metrics['result']=result['status']
-    if result['status'] == 'invalid_evidence' and deadline - time.monotonic() >= 5:
+    generation.check()
+    if result['status'] in ('invalid_evidence','scope_mismatch') and deadline - time.monotonic() >= 5:
         # One repair, within the original budget. Never accept an unchecked draft.
         try:
             with stage('citation_repair'):
@@ -337,7 +361,7 @@ def answer(question, history=None, n_results=10, deadline=None, photo_context=No
                     system=SYSTEM + "\n" + farm.context(), deadline=deadline,
                     response_schema=GroundedAnswer,request_timeout=10,max_attempts=1)
             with stage('repair_validation') as metrics:
-                result = validate_answer(repaired,chunks,search_q)
+                result = validate_answer(repaired,chunks,search_q,general_overview=general_overview)
                 metrics['result']=result['status']
         except ServiceUnavailable:
             pass  # Preserve the verified refusal if repair is unavailable.
@@ -356,7 +380,11 @@ PHOTO_SYSTEM = """Ти описуєш фото для українського �
 Оціни тільки прикріплене зараз фото. Якщо користувач питає, що це за рослина, possible_identity містить ймовірну назву, лише якщо є достатні характерні видимі ознаки; інакше поясни, якого ракурсу бракує. Не підмінюй визначення рослини просто списком кольорів. Не визначай сорт за зовнішнім виглядом. Історія допомагає зрозуміти питання, але попереднє фото ти не бачиш; не перенось його ознаки на нове. observations: короткі об'єктивно видимі ознаки українською (колір, форма, плями, пошкодження), без діагнозу, визначення дефіциту чи назви збудника як встановленого факту. Не вигадуй невидимий бік листка, масштаб, сорт, ґрунт чи погоду. Не визначай на дотик твердість, запах, вологість, лабораторні показники або підтверджену стиглість із фото. Для качана опиши лише видиму виповненість зерен, колір, стан обгорток та видимість основи зернівки; відсутній ракурс означає невідоме. Не призначай препарати, дози, суміші, добрива або ремонтні операції. Якщо зображення нечитабельне або не показує аграрний об'єкт, usable=false. questions: до 4 конкретних уточнень або потрібних ракурсів. search_query: короткий пошуковий запит за видимими ознаками й культурою, якщо її надав користувач, без вигаданого підтвердженого діагнозу. Немає придатних ознак — порожній search_query. Поля містять звичайний текст без посилань [S1]."""
 
 
+PHOTO_SYSTEM += "\n"+PLAIN_UKRAINIAN
+
+
 def answer_photo(question, image, history=None):
+    generation.check()
     calculation=intent.drying_answer(question)
     harvest_followup=any(weather.field_work(m['content']) for m in (history or [])[-6:] if m['role']=='user')
     if calculation and (not harvest_followup or re.search(r'розрах|порах|усуш|скільки.*(?:ваг|мас)|заліков',question.lower())):return calculation

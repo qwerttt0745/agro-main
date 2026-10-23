@@ -1,22 +1,32 @@
-"""Fixed free-tier-eligible model pool, with process-local circuit breakers.
+"""Configurable Gemini pool, with process-local circuit breakers.
 Pricing eligibility is not a billing override; the Google project controls its tier.
 """
+import os
 import math
 import re
 import threading
 import time
 
-# Verified against Google pricing + models.list on 2026-10-20.
+# Published free-tier pricing checked on 2026-10-23; project access is separate.
 MODELS = ('gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-3.5-flash-lite',
-          'gemini-3.1-flash-lite', 'gemini-2.5-flash')
+          'gemini-3.1-flash-lite', 'gemini-2.5-flash',
+          'gemini-2.5-flash-lite', 'gemini-3-flash-preview')
 _lock = threading.Lock()
 _state = {}
+
+
+def configured_models():
+    extra=[name.strip() for name in os.getenv('AGRO_EXTRA_MODELS','').split(',') if name.strip()]
+    for name in extra:
+        if not re.fullmatch(r'gemini-[a-z0-9][a-z0-9.-]{0,100}',name):
+            raise ValueError('AGRO_EXTRA_MODELS must contain comma-separated Gemini model IDs.')
+    return tuple(dict.fromkeys((*MODELS,*extra)))
 
 
 def candidates():
     with _lock:
         now = time.time()
-        return [m for m in MODELS if _state.get(m, {}).get('until', 0) <= now]
+        return [m for m in configured_models() if _state.get(m, {}).get('until', 0) <= now]
 
 
 def success(model, elapsed):
@@ -63,4 +73,4 @@ def status():
                  'reason':_state.get(m,{}).get('reason'),
                  'last_success':_state.get(m,{}).get('last_success'),
                  'latency_seconds':_state.get(m,{}).get('latency_seconds')}
-                for m in MODELS]
+                for m in configured_models()]

@@ -9,8 +9,8 @@ class GeminiFailureTests(unittest.TestCase):
         self.state = patch.object(model_pool, '_state', {})
         self.state.start();self.addCleanup(self.state.stop)
 
-    def test_switch_all_five_without_repeating(self):
-        client=Mock();client.models.generate_content.side_effect=[errors.ServerError(503,{'message':'busy'})]*4+[SimpleNamespace(text='ok')]
+    def test_switch_entire_pool_without_repeating(self):
+        client=Mock();client.models.generate_content.side_effect=[errors.ServerError(503,{'message':'busy'})]*(len(model_pool.MODELS)-1)+[SimpleNamespace(text='ok')]
         with patch.object(rag,'llm_client',return_value=client):self.assertEqual(rag._generate('q'),'ok')
         self.assertEqual([c.kwargs['model'] for c in client.models.generate_content.call_args_list],list(model_pool.MODELS))
         self.assertEqual(model_pool.candidates(),[model_pool.MODELS[-1]])
@@ -53,7 +53,7 @@ class GeminiFailureTests(unittest.TestCase):
     def test_all_overloaded_are_bounded(self):
         client=Mock();client.models.generate_content.side_effect=errors.ServerError(503,{'message':'busy'})
         with patch.object(rag,'llm_client',return_value=client),self.assertRaises(rag.ServiceUnavailable):rag._generate('q')
-        self.assertEqual(client.models.generate_content.call_count,5)
+        self.assertEqual(client.models.generate_content.call_count,len(model_pool.MODELS))
         self.assertEqual(model_pool.candidates(),[])
 
     def test_failed_questions_do_not_require_rewrite(self):

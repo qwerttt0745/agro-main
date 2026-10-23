@@ -178,6 +178,7 @@ textarea::placeholder{color:var(--mute)}
 <script>
 const $ = s => document.querySelector(s);
 const feed = $('#feed'), scroll = $('#scroll'), q = $('#q'), send = $('#send');
+let activeRequest=null;
 let chatId = null, busy = false, pendingPhoto = null, photoLoading = false, photoVersion = 0;
 
 const esc = s => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -226,7 +227,32 @@ function photoHtml(url) {
   return typeof url === 'string' && (/^\/chats\/\d+\/photos\/[a-f0-9]{32}$/.test(url) || /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(url))
     ? `<img class="photo-preview" src="${url}" alt="Фото до запиту">` : '';
 }
-function refreshSend(){send.disabled = busy || photoLoading || (!q.value.trim() && !pendingPhoto);$('#attach-photo').disabled=busy||photoLoading;}
+function refreshSend(){
+ send.type=busy?'button':'submit';send.textContent=busy?'■':'↑';
+ send.setAttribute('aria-label',busy?'Зупинити запит':'Надіслати');send.title=busy?'Стоп':'Надіслати';
+ send.disabled=busy?(!activeRequest||activeRequest.stopping):(photoLoading||(!q.value.trim()&&!pendingPhoto));
+ $('#attach-photo').disabled=busy||photoLoading;
+}
+async function executeAI(path,payload,message){
+ const requestId=typeof crypto.randomUUID==='function'?crypto.randomUUID():Array.from(crypto.getRandomValues(new Uint8Array(18)),b=>b.toString(16).padStart(2,'0')).join('');
+ const active={id:requestId,chatId,controller:new AbortController(),message,stopping:false,cancelled:false};
+ activeRequest=active;refreshSend();
+ try{return await api(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...payload,request_id:active.id}),signal:active.controller.signal});}
+ catch(error){if(active.cancelled)return {status:'cancelled',answer:'Запит зупинено. Прийняте питання залишилося в історії.',pages:[],sources:[]};throw error;}
+ finally{if(activeRequest===active)activeRequest=null;}
+}
+async function stopRequest(){
+ const active=activeRequest;if(!active||active.stopping)return;
+ active.stopping=true;refreshSend();
+ try{
+  const result=await api(`/chats/${active.chatId}/cancel`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({request_id:active.id})});
+  if(activeRequest!==active)return;
+  if(result.status==='cancelled'){active.cancelled=true;active.controller.abort();}
+ }catch(error){
+  if(activeRequest===active){const note=document.createElement('small');note.textContent='Не вдалося зупинити запит. Спробуйте ще раз.';active.message.querySelector('.body').append(note);}
+ }finally{if(activeRequest===active){active.stopping=false;refreshSend();}}
+}
+send.addEventListener('click',event=>{if(busy){event.preventDefault();stopRequest();}});
 function clearPhoto(){photoVersion++;pendingPhoto=null;photoLoading=false;$('#photo').value='';$('#photo-preview').innerHTML='';$('#remove-photo').hidden=true;$('#photo-note').textContent='';refreshSend();}
 $('#attach-photo').onclick=()=>{if(!busy&&!photoLoading)$('#photo').click();};
 $('#remove-photo').onclick=()=>{if(!busy)clearPhoto();};
@@ -262,8 +288,8 @@ function showRetry(message, text, retryable=true, retryAfter=0){
     busy=true;refreshSend();button.disabled=true;button.textContent='Шукаю доступну модель…';
     const id=chatId;
     try{
-      const r=await api(`/chats/${id}/retry`,{method:'POST'});
-      if(r.status==='unavailable')showRetry(message,r.answer,r.retryable,r.retry_after);
+      const r=await executeAI(`/chats/${id}/retry`,{},message);
+      if(r.status==='unavailable'||r.status==='cancelled')showRetry(message,r.answer,r.retryable,r.retry_after);
       else body.innerHTML=renderAnswer(r.answer,r.sources);
     }catch(e){showRetry(message,e.message);}
     finally{busy=false;refreshSend();}
@@ -356,10 +382,8 @@ async function ask(text){
     const waitTimer=setInterval(()=>{const note=wait.querySelector('[data-wait-time]');if(note){const seconds=Math.floor((Date.now()-startedAt)/1000);note.textContent=(seconds>=20?'Обробка триває довше звичайного… ':'Шукаю відповідь і перевіряю джерела… ')+seconds+' с';}},1000);
     
     try {
-      const r = await api(`/chats/${chatId}/ask`, {
-        method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text, photo:attached?.data || null})
-      });
-      if(r.status==='unavailable') showRetry(wait,r.answer,r.retryable,r.retry_after);
+      const r=await executeAI(`/chats/${chatId}/ask`,{text,photo:attached?.data||null},wait);
+      if(r.status==='unavailable'||r.status==='cancelled') showRetry(wait,r.answer,r.retryable,r.retry_after);
       else wait.querySelector('.body').innerHTML = renderAnswer(r.answer, r.sources);
     } catch (e) {
       wait.querySelector('.body').innerHTML =

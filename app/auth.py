@@ -29,6 +29,8 @@ def connect():
     connection.execute('CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,version TEXT,expires REAL,user_id INTEGER NOT NULL REFERENCES users(id))')
     connection.execute('CREATE TABLE IF NOT EXISTS attempts(ip TEXT,at REAL)')
     connection.execute('CREATE INDEX IF NOT EXISTS attempts_ip ON attempts(ip,at)')
+    connection.execute('CREATE TABLE IF NOT EXISTS login_attempts(ip TEXT NOT NULL,account_key TEXT NOT NULL,at REAL NOT NULL)')
+    connection.execute('CREATE INDEX IF NOT EXISTS login_attempts_account ON login_attempts(ip,account_key,at)')
     return connection
 
 
@@ -115,15 +117,21 @@ def login(request:Request,form:Login):
     if not secure and request.url.hostname not in ('127.0.0.1','localhost','testserver'):
         raise HTTPException(503,'Для зовнішнього доступу потрібен HTTPS.')
     ip=request.client.host if request.client else 'unknown'
+    username=form.username.strip()
+    account_key=hashlib.sha256(username.encode()).hexdigest()
     conn=connect();now=time.time()
     try:
         # Serialize attempt reservation, so parallel attempts cannot bypass the limit.
         conn.execute('BEGIN IMMEDIATE')
-        conn.execute('DELETE FROM attempts WHERE at<?',(now-900,))
-        if conn.execute('SELECT count(*) FROM attempts WHERE ip=?',(ip,)).fetchone()[0]>=5:
-            conn.rollback();raise HTTPException(429,'Забагато спроб. Спробуйте через 15 хвилин.')
-        conn.execute('INSERT INTO attempts VALUES (?,?)',(ip,now));conn.commit()
-        record=conn.execute('SELECT * FROM users WHERE username=?',(form.username,)).fetchone()
+        conn.execute('DELETE FROM login_attempts WHERE at<?',(now-900,))
+        account_attempts=conn.execute('SELECT count(*) FROM login_attempts WHERE ip=? AND account_key=?',(ip,account_key)).fetchone()[0]
+        all_attempts=conn.execute('SELECT count(*) FROM login_attempts WHERE ip=?',(ip,)).fetchone()[0]
+        if account_attempts>=5:
+            conn.rollback();raise HTTPException(429,'Забагато спроб для цього логіна. Спробуйте через 15 хвилин.')
+        if all_attempts>=100:
+            conn.rollback();raise HTTPException(429,'Забагато спроб входу з цієї мережі. Спробуйте через 15 хвилин.')
+        conn.execute('INSERT INTO login_attempts VALUES (?,?,?)',(ip,account_key,now));conn.commit()
+        record=conn.execute('SELECT * FROM users WHERE username=?',(username,)).fetchone()
         computed=digest(form.password,record['salt'] if record else '00'*16)
         correct=hmac.compare_digest(computed,record['password_hash'] if record else '00'*64)
         if not (record and correct and record['is_active']):
@@ -131,7 +139,7 @@ def login(request:Request,form:Login):
         token=secrets.token_urlsafe(32)
         conn.execute('DELETE FROM sessions WHERE expires<?',(now,))
         conn.execute('INSERT INTO sessions(token,version,expires,user_id) VALUES (?,?,?,?)',(hashlib.sha256(token.encode()).hexdigest(),record['version'],now+TTL,record['id']))
-        conn.execute('DELETE FROM attempts WHERE ip=?',(ip,));conn.commit()
+        conn.execute('DELETE FROM login_attempts WHERE ip=? AND account_key=?',(ip,account_key));conn.commit()
     finally:conn.close()
     response=JSONResponse({'ok':True})
     response.set_cookie(COOKIE,token,max_age=TTL,httponly=True,secure=secure,samesite='strict',path='/')

@@ -69,3 +69,32 @@ def drying_answer(question):
     final=m*(100-a)/(100-b);water=m-final
     fmt=lambda v:format(v.quantize(Decimal('0.01')),'f').replace('.',',')
     return {'answer':f'Після сушіння з {fmt(a)}% до {fmt(b)}% із {fmt(m)} кг отримаєте приблизно **{fmt(final)} кг зерна**. Розрахункове зменшення маси через видалення води — **{fmt(water)} кг** ({fmt(water/m*100)}% початкової маси).\n\nФормула збереження сухої речовини: кінцева маса = {fmt(m)} × (100 − {fmt(a)}) ÷ (100 − {fmt(b)}).\n\nЦе теоретичний баланс за наданими вами числами: без очищення від домішок, втрат сухої речовини та похибки вимірювання. 14% тут — задана вами ціль, а не перевірений мною стандарт. Залікова маса за договором може відрізнятися. Фото не визначає вологість і не змінює цей розрахунок.', 'pages':[], 'sources':[], 'status':'calculated'}
+
+
+_CROPS=(('пшениц','пшениця'),('греч','гречка'),('кукурудз','кукурудза'),('соняшник','соняшник'),('ріпак','ріпак'),('ячмін','ячмінь'),('со[яїю]','соя'))
+
+
+def general_cultivation(question):
+    """A broad growing overview is not a request for a chemical prescription."""
+    q=question.lower()
+    if seed_mass(question) is not None:return False
+    broad=bool(re.search(r'(?:\b(?:як|де)\b|правильн|технолог|основ|етап|план|порад).*?(?:вирощ|сади|садж|сія)|(?:вирощ|сади|садж).*?(?:правильн|основ)',q))
+    explicit=bool(re.search(r'гербіц|фунгіц|інсектиц|пестиц|обприск|протру|доз|бакова|бакову|строк.*очікуван|норм.*(?:добрив|азот|внес|піджив)|скільки.*(?:добрив|азот|внес|піджив)|план.*(?:живлен|удобр)',q))
+    return broad and not explicit
+
+
+def overview_question(question,history=None):
+    """Resolve only the crop from actual user messages, never prior assistant refusals."""
+    messages=[question]+[m['content'] for m in reversed((history or [])[-8:]) if m['role']=='user']
+    for text in messages:
+        for stem,name in _CROPS:
+            if re.search(stem,text.lower()):return f'Як правильно вирощувати {name}?'
+    return question
+
+
+def contains_prescription(answer):
+    """Reject concrete product/nutrient rates from the broad-overview route."""
+    q=answer.lower()
+    product=r'добрив|азот|карбамід|селітр|пестиц|гербіц|фунгіц|інсектиц|препарат|обприск|протру'
+    rate=r'\d+(?:[.,]\d+)?\s*(?:[–—-]\s*\d+(?:[.,]\d+)?)?\s*(?:кг|л|г|мл|мг|kg|ml|l)\s*(?:/|на)\s*(?:га|гектар|л|літр|ha)'
+    return any(re.search(product,part) and re.search(rate,part) for part in re.split(r'[!?;\n]|\.(?!\d)',q))
