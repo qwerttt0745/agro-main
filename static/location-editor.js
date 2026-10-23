@@ -28,6 +28,7 @@ window.AgroLocationEditor=class {
   const coords=make('div','',inputHost);coords.className='coordinates';
   const input=(label,key,min,max)=>{const l=make('label',label,coords),n=make('input','',l);n.type='number';n.name=key;n.min=min;n.max=max;n.step='any';n.placeholder='Не задано';n.addEventListener('input',()=>{this.renderPoint(false);this.onChange();});return n;};
   this.lat=input('Широта','latitude',-90,90);this.lon=input('Довгота','longitude',-180,180);
+  const show=make('button','Показати точку на карті',inputHost);show.type='button';show.onclick=()=>this.renderPoint(true);
   const clear=make('button',polygon?'Прибрати окрему точку':'Прибрати точку',inputHost);clear.type='button';clear.onclick=()=>{this.lat.value='';this.lon.value='';this.name.value='';this.renderPoint(false);this.onChange();};
   make('p','Координати позначають точку, а не межі ферми. Не визначають тип ґрунту чи площу.',inputHost).className='hint';
   this.name.addEventListener('input',()=>this.onChange());
@@ -35,7 +36,7 @@ window.AgroLocationEditor=class {
   // World overview only: there is no default farm point or field boundary.
   this.map=L.map(this.mapHost,{worldCopyJump:true}).fitWorld();
   L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,referrerPolicy:'strict-origin-when-cross-origin',attribution:'&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors'}).addTo(this.map).on('tileerror',()=>{this.status.textContent='Підкладка карти тимчасово недоступна. Координати можна ввести вручну.';});
-  this.map.on('click',e=>{if(this.polygon&&this.mode==='boundary'){if(!this.drawing)return;if(this.points.length>=200){this.status.textContent='До 200 вершин на поле.';return;}this.points.push([e.latlng.lat,e.latlng.lng]);this.renderBoundary();}else{this.setPoint(e.latlng.lat,e.latlng.lng);this.name.value='';this.onChange();}});
+  this.map.on('click',e=>{if(this.polygon&&this.mode==='boundary'){if(!this.drawing)return;if(this.points.length>=200){this.status.textContent='До 200 вершин на поле.';return;}this.points.push([e.latlng.lat,e.latlng.wrap().lng]);this.renderBoundary();}else{this.setPoint(e.latlng.lat,e.latlng.wrap().lng);this.name.value='';this.onChange();}});
  }
  value(){const number=n=>n.value===''?null:Number(n.value);return {latitude:number(this.lat),longitude:number(this.lon),location_name:this.name.value.trim()};}
  boundary(){if(!this.points.length)return null;if(this.points.length<3)throw Error('Для межі поля потрібно щонайменше три вершини.');const ring=this.points.map(([lat,lon])=>[lon,lat]);return {type:'Polygon',coordinates:[[...ring,[...ring[0]]]]};}
